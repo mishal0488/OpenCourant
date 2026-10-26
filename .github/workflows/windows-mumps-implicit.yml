@@ -1,0 +1,98 @@
+name: Windows implicit Engine (MUMPS)
+
+# Dedicated fork workflow: builds a native Windows, double-precision Intel MPI
+# Engine with MUMPS enabled. Does not replace the regular Windows release.
+on:
+  push:
+    branches:
+      - build/windows-implicit-mumps
+    paths:
+      - .github/workflows/windows-mumps-implicit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-mumps-engine:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Checkout OpenCourant source
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Install or restore Intel oneAPI (ifx, icx, MKL, Intel MPI)
+        uses: ./.github/actions/setup-oneapi-win
+
+      - name: Download and verify MUMPS 5.5.1 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'engine\extlib'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $archive = Join-Path $env:RUNNER_TEMP 'MUMPS_5.5.1.tar.gz'
+          $urls = @(
+            'https://web.cels.anl.gov/projects/petsc/download/externalpackages/MUMPS_5.5.1.tar.gz',
+            'https://graal.ens-lyon.fr/MUMPS/MUMPS_5.5.1.tar.gz'
+          )
+          $downloaded = $false
+          foreach ($url in $urls) {
+            & curl.exe -fLSs --retry 4 --retry-delay 5 --output $archive $url
+            if ($LASTEXITCODE -eq 0) { $downloaded = $true; break }
+            Write-Warning "MUMPS download failed from $url"
+          }
+          if (-not $downloaded) { throw 'Could not download MUMPS source.' }
+          $actual = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLowerInvariant()
+          $expected = '1abff294fa47ee4cfd50dfd5c595942b72ebfcedce08142a75a99ab35014fa15'
+          if ($actual -ne $expected) {
+            throw "MUMPS 5.5.1 checksum mismatch: $actual (expected $expected)"
+          }
+          & tar.exe -xzf $archive -C $dir
+          if ($LASTEXITCODE -ne 0) { throw 'MUMPS archive extraction failed.' }
+          $source = Join-Path $dir 'MUMPS_5.5.1'
+          if (-not (Test-Path (Join-Path $source 'src'))) {
+            throw "Expected MUMPS source not found at $source"
+          }
+          Write-Host "Verified MUMPS source in $source"
+          Write-Host 'OpenCourant CMake will include MUMPS automatically for Intel MPI + dp.'
+
+      - name: Compile Intel MPI double-precision Windows Engine
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          call "C:\Program Files (x86)\Intel\oneAPI\compiler\2025.0\env\vars.bat"
+          if errorlevel 1 exit /b 1
+          call "C:\Program Files (x86)\Intel\oneAPI\mkl\2025.0\env\vars.bat"
+          if errorlevel 1 exit /b 1
+          call "C:\Program Files (x86)\Intel\oneAPI\mpi\latest\env\vars.bat"
+          if errorlevel 1 exit /b 1
+          cd engine
+          call build_windows.bat -release -arch win64 -mpi impi -prec dp -nt 4
+          if errorlevel 1 exit /b 1
+          cd ..
+          if not exist exec\engine_win64_impi.exe (echo Missing Engine executable & exit /b 1)
+
+      - name: Verify Windows output
+        shell: pwsh
+        run: |
+          $exe = 'exec/engine_win64_impi.exe'
+          if (-not (Test-Path $exe)) { throw 'Windows Engine executable is missing.' }
+          $build = 'engine/cbuild_engine_win64_impi_ninja'
+          if (-not (Test-Path $build)) { throw 'Expected build directory not found.' }
+          $files = Get-ChildItem -Path $build -Recurse -File -Include 'build.ninja','flags.make','*.rsp'
+          $matches = $files | Select-String -Pattern 'MUMPS5' -List -ErrorAction SilentlyContinue
+          if (-not $matches) {
+            throw 'Build configuration does not appear to define MUMPS5.'
+          }
+          Write-Host 'Found MUMPS5 in compiled build configuration.'
+          Get-Item $exe | Select-Object Name,Length,LastWriteTime
+
+      - name: Upload MUMPS-enabled Windows Engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenCourant-Windows-implicit-MUMPS-engine
+          path: exec/engine_win64_impi.exe
+          if-no-files-found: error
+          retention-days: 14
